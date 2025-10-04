@@ -36,6 +36,8 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Iterable, List
+import tempfile
+import math
 
 
 # Recognized video file extensions (lowercase)
@@ -71,61 +73,137 @@ def make_output_path(input_path: Path, input_root: Path, output_root: Path) -> P
     out_rel = rel.with_suffix('.webm')
     return output_root.joinpath(out_rel)
 
+
+def _get_source_bitrate_kbps(input_path: Path) -> int | None:
+    """Return the video stream bitrate in kb/s if available, else try to estimate from filesize/duration."""
+    try:
+        proc = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=bit_rate', '-of', 'default=noprint_wrappers=1:nokey=1',
+             str(input_path)],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        out = proc.stdout.decode().strip()
+        if out and out != 'N/A':
+            try:
+                bit_rate = int(float(out))
+                if bit_rate > 0:
+                    return int(round(bit_rate / 1000.0))
+            except Exception:
+                pass
+
+        # fallback: try container duration then compute kbps from filesize
+        proc2 = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=nokey=1:noprint_wrappers=1', str(input_path)],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        dur_out = proc2.stdout.decode().strip()
+        duration = None
+        try:
+            duration = float(dur_out)
+        except Exception:
+            duration = None
+
+        if duration and duration > 0:
+            size_bytes = input_path.stat().st_size
+            kbps = int(round((size_bytes * 8) / 1000.0 / duration))
+            return kbps
+    except Exception:
+        pass
+    return None
+
 def convert_one(input_path: Path, output_path: Path, crf: int, overwrite: bool, pretend: bool) -> tuple[Path, bool, str]:
     """
-    Convert a single file to WebM (VP9 + Opus).
-    Keeps the input video's resolution (explicitly via a scale filter `scale=iw:ih`).
+    Two-pass VP9 conversion targeting a bitrate slightly lower than the source average.
     Returns (input_path, success, message)
+    NOTE: 'crf' argument is ignored for two-pass mode (we target bitrate instead).
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and not overwrite:
         return input_path, False, f"skipped (exists): {output_path}"
 
+    # Null device depends on platform
+    null_dev = 'NUL' if os.name == 'nt' else '/dev/null'
 
-    # Build ffmpeg command. We use libvpx-vp9 and libopus.
-    # We explicitly set a scale filter to preserve the input resolution (scale=iw:ih).
-    # -y to overwrite handled only when overwrite is True
-    cmd = [
-    'ffmpeg',
-    '-hide_banner',
-    '-loglevel', 'error',
-    '-i', str(input_path),
-    '-c:v', 'libvpx-vp9',
-    '-crf', str(crf),
-    '-b:v', '0', # CRF-based for libvpx-vp9
-    '-tile-columns', '4',
-    '-frame-parallel', '1',
-    '-speed', '1', # tradeoff speed/quality, 0=best, up to 5 fastest; 1 is slow but high quality
-    # Preserve input resolution explicitly (iw/ih = input width/height)
-    '-vf', 'scale=iw:ih',
-    '-c:a', 'libopus',
-    '-b:a', '64k',
-    '-f', 'webm',
+    # Measure source bitrate (kbps)
+    source_kbps = _get_source_bitrate_kbps(input_path)
+    if source_kbps is None or source_kbps <= 0:
+        # fallback conservative default (kbps)
+        source_kbps = 1200
+
+    # Choose a target bitrate: 75% of source by default
+    multiplier = 0.75
+    target_kbps = max(200, int(math.floor(source_kbps * multiplier)))
+
+    # Create a unique temporary directory for passlog to avoid collisions in parallel runs
+    tmpdir = Path(tempfile.mkdtemp(prefix='vp9-pass-'))
+    passlog_base = tmpdir / 'ffpass'  # ffmpeg will append -0.log etc.
+
+    # Common flags for VP9 two-pass encoding
+    vp9_common = [
+        '-c:v', 'libvpx-vp9',
+        '-b:v', f'{target_kbps}k',
+        '-tile-columns', '4',
+        '-frame-parallel', '1',
+        '-speed', '1',
+        '-passlogfile', str(passlog_base)
     ]
 
+    # First pass: no audio, output to null device
+    pass1_cmd = [
+        'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(input_path),
+    ] + vp9_common + [
+        '-pass', '1',
+        '-an',
+        '-f', 'null',
+        null_dev,
+    ]
 
-    if overwrite:
-        cmd.insert(1, '-y')
-    else:
-        cmd.insert(1, '-n') # don't overwrite
-
-
-    cmd.append(str(output_path))
-
+    # Second pass: encode audio and write final webm
+    pass2_cmd = [
+        'ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', str(input_path),
+    ] + vp9_common + [
+        '-pass', '2',
+        '-c:a', 'libopus',
+        '-b:a', '64k',
+        '-vf', 'scale=iw:ih',
+        '-f', 'webm',
+        str(output_path),
+    ]
 
     if pretend:
-        return input_path, True, 'pretend: ' + ' '.join(cmd)
-
+        # cleanup tmpdir and return the printed commands instead of running
+        try:
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
+        return input_path, True, 'pretend pass1: ' + ' '.join(pass1_cmd) + '\npretend pass2: ' + ' '.join(pass2_cmd)
 
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return input_path, True, f'converted -> {output_path}'
+        # Run first pass
+        subprocess.run(pass1_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Run second pass
+        subprocess.run(pass2_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # cleanup
+        try:
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
+        return input_path, True, f'converted (two-pass {target_kbps}k) -> {output_path}'
     except subprocess.CalledProcessError as e:
         err = e.stderr.decode(errors='ignore') if e.stderr else str(e)
+        try:
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
         return input_path, False, f'ffmpeg error: {err[:500]}'
     except Exception as e:
+        try:
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
         return input_path, False, f'exception: {e}'
-    
 
 
 def chunked(iterable: Iterable, size: int) -> Iterable[List]:
