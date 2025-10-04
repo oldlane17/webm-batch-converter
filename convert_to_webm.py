@@ -74,6 +74,7 @@ def make_output_path(input_path: Path, input_root: Path, output_root: Path) -> P
 def convert_one(input_path: Path, output_path: Path, crf: int, overwrite: bool, pretend: bool) -> tuple[Path, bool, str]:
     """
     Convert a single file to WebM (VP9 + Opus).
+    Keeps the input video's resolution (explicitly via a scale filter `scale=iw:ih`).
     Returns (input_path, success, message)
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -82,6 +83,7 @@ def convert_one(input_path: Path, output_path: Path, crf: int, overwrite: bool, 
 
 
     # Build ffmpeg command. We use libvpx-vp9 and libopus.
+    # We explicitly set a scale filter to preserve the input resolution (scale=iw:ih).
     # -y to overwrite handled only when overwrite is True
     cmd = [
     'ffmpeg',
@@ -94,6 +96,8 @@ def convert_one(input_path: Path, output_path: Path, crf: int, overwrite: bool, 
     '-tile-columns', '4',
     '-frame-parallel', '1',
     '-speed', '1', # tradeoff speed/quality, 0=best, up to 5 fastest; 1 is slow but high quality
+    # Preserve input resolution explicitly (iw/ih = input width/height)
+    '-vf', 'scale=iw:ih',
     '-c:a', 'libopus',
     '-b:a', '64k',
     '-f', 'webm',
