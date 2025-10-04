@@ -73,7 +73,6 @@ def make_output_path(input_path: Path, input_root: Path, output_root: Path) -> P
     out_rel = rel.with_suffix('.webm')
     return output_root.joinpath(out_rel)
 
-
 def _get_source_stats(input_path: Path) -> tuple[int | None, float | None, int]:
     """
     Return (source_kbps, duration_seconds, filesize_bytes)
@@ -87,7 +86,6 @@ def _get_source_stats(input_path: Path) -> tuple[int | None, float | None, int]:
     source_kbps = None
 
     try:
-        # Try to get stream bit_rate and duration via ffprobe (video stream)
         proc = subprocess.run(
             ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
              '-show_entries', 'stream=bit_rate,duration', '-of', 'default=noprint_wrappers=1:nokey=1',
@@ -95,7 +93,6 @@ def _get_source_stats(input_path: Path) -> tuple[int | None, float | None, int]:
             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         lines = [l.strip() for l in proc.stdout.decode().splitlines() if l.strip() != '']
-        # lines may contain bit_rate on first non-empty line, duration on second
         bit_rate = None
         if len(lines) >= 1:
             try:
@@ -115,10 +112,9 @@ def _get_source_stats(input_path: Path) -> tuple[int | None, float | None, int]:
         if bit_rate and bit_rate > 0:
             source_kbps = int(round(bit_rate / 1000.0))
     except Exception:
-        # fall through to other heuristics
         pass
 
-    # If we didn't get duration yet, try format duration
+    # fallback: try format duration
     if duration is None:
         try:
             proc2 = subprocess.run(
@@ -132,7 +128,7 @@ def _get_source_stats(input_path: Path) -> tuple[int | None, float | None, int]:
         except Exception:
             duration = None
 
-    # If still no source_kbps, compute from filesize/duration (total container bitrate)
+    # compute from filesize/duration if needed (container avg bitrate)
     if (source_kbps is None or source_kbps == 0) and duration and duration > 0:
         try:
             kbps = int(round((filesize * 8) / 1000.0 / duration))
@@ -142,38 +138,42 @@ def _get_source_stats(input_path: Path) -> tuple[int | None, float | None, int]:
 
     return source_kbps, duration, filesize
 
+
 def convert_one(input_path: Path, output_path: Path, crf: int, overwrite: bool, pretend: bool) -> tuple[Path, bool, str]:
     """
-    Smart conversion:
-      - For low-bitrate/small videos, use CRF single-pass (smaller outputs).
-      - For larger/high-bitrate videos, use two-pass VP9 targeting 70% of source_kbps.
-    The 'crf' parameter acts as a fallback CRF for single-pass mode (unless two-pass chosen).
+    Adaptive conversion:
+      - For very small / low-bitrate inputs: use single-pass CRF with high CRF and low audio bitrate (keeps outputs small).
+      - Otherwise: two-pass VP9 but compute target bitrate from original filesize so target_total_kbps < original_total_kbps.
+    Returns (input_path, success, message).
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and not overwrite:
         return input_path, False, f"skipped (exists): {output_path}"
 
-    # Platform null device
     null_dev = 'NUL' if os.name == 'nt' else '/dev/null'
 
-    # Get source stats
+    # Gather stats
     source_kbps, duration, filesize = _get_source_stats(input_path)
+    debug = []
+    debug.append(f"measured: source_kbps={source_kbps}, duration={duration}, filesize={filesize}")
 
-    debug_lines = []
-    debug_lines.append(f"source_kbps={source_kbps} kb/s, duration={duration}, filesize={filesize} bytes")
+    if source_kbps is None or source_kbps <= 0 or duration is None or duration <= 0:
+        # conservative fallback if measurement fails
+        source_kbps = int(max(120, (filesize * 8) / 1000.0 / (duration if duration and duration > 0 else 1)))
+        debug.append(f"fallback source_kbps -> {source_kbps}")
 
-    # If we fail to measure, assume a conservative default
-    if source_kbps is None or source_kbps <= 0:
-        source_kbps = 1200
-        debug_lines.append("measured source_kbps missing -> fallback 1200 kb/s")
+    # Heuristics and tunables:
+    # If the input total avg bitrate is small, prefer CRF single-pass to avoid encoder overhead.
+    SMALL_TOTAL_KBPS = 500   # if original total kbps < this, use CRF single-pass
+    CRF_FOR_SMALL = max(crf, 34)  # higher CRF -> smaller file for small inputs
+    AUDIO_KBPS_SMALL = 32     # use 32 kb/s audio for tiny files
+    AUDIO_KBPS_NORMAL = 64    # usual audio bitrate for larger files
 
-    # Heuristic decision: if source_kbps is small, prefer CRF single-pass to avoid overhead inflation.
-    SMALL_THRESHOLD_KBPS = 400  # configurable: below this we prefer CRF single-pass
-    if source_kbps < SMALL_THRESHOLD_KBPS:
-        # Use CRF single-pass with a relatively high CRF to keep file small.
-        # Choose a CRF that is no lower than the provided 'crf' but biased towards smaller output.
-        chosen_crf = max(crf, 30)  # default to at least 30 for tiny/low-bitrate inputs
-        debug_lines.append(f"Choosing CRF single-pass mode with crf={chosen_crf} because source_kbps < {SMALL_THRESHOLD_KBPS}")
+    if source_kbps < SMALL_TOTAL_KBPS:
+        # Single-pass CRF optimized for small files
+        chosen_crf = CRF_FOR_SMALL
+        audio_kbps = AUDIO_KBPS_SMALL
+        debug.append(f"Choosing single-pass CRF mode (crf={chosen_crf}, audio={audio_kbps} kb/s) because source_kbps < {SMALL_TOTAL_KBPS}")
 
         cmd = [
             'ffmpeg', '-hide_banner', '-loglevel', 'error',
@@ -186,43 +186,49 @@ def convert_one(input_path: Path, output_path: Path, crf: int, overwrite: bool, 
             '-speed', '1',
             '-vf', 'scale=iw:ih',
             '-c:a', 'libopus',
-            '-b:a', '64k',
+            '-b:a', f'{audio_kbps}k',
             '-f', 'webm',
         ]
         if overwrite:
             cmd.insert(1, '-y')
         else:
             cmd.insert(1, '-n')
-
         cmd.append(str(output_path))
 
         if pretend:
-            return input_path, True, 'pretend: ' + ' '.join(cmd) + '\n' + '\n'.join(debug_lines)
+            return input_path, True, 'pretend: ' + ' '.join(cmd) + '\n' + '\n'.join(debug)
 
         try:
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            return input_path, True, f'converted (crf={chosen_crf}) -> {output_path}\\n' + '\\n'.join(debug_lines)
+            return input_path, True, f'converted (crf={chosen_crf}, audio={audio_kbps}k) -> {output_path}\n' + '\n'.join(debug)
         except subprocess.CalledProcessError as e:
             err = e.stderr.decode(errors='ignore') if e.stderr else str(e)
-            return input_path, False, f'ffmpeg error: {err[:500]}\\n' + '\\n'.join(debug_lines)
+            return input_path, False, f'ffmpeg error: {err[:500]}\n' + '\n'.join(debug)
         except Exception as e:
-            return input_path, False, f'exception: {e}\\n' + '\\n'.join(debug_lines)
+            return input_path, False, f'exception: {e}\n' + '\n'.join(debug)
 
-    # Otherwise use two-pass
-    multiplier = 0.7
-    target_kbps = max(64, int(math.floor(source_kbps * multiplier)))
-    # never exceed source_kbps
-    if target_kbps >= source_kbps:
-        target_kbps = max(64, int(source_kbps * 0.9))
+    # Otherwise compute a target total kbps that is guaranteed lower than original
+    desired_ratio = 0.60   # target total bitrate = 60% of original total bitrate (tune this)
+    orig_total_kbps = source_kbps
+    target_total_kbps = max(64, int(math.floor(orig_total_kbps * desired_ratio)))
+    # choose audio kbps for normal files
+    audio_kbps = AUDIO_KBPS_NORMAL
+    # make sure we leave some room for audio; video_kbps = target_total - audio_kbps
+    video_kbps = max(32, int(target_total_kbps - audio_kbps))
+    # Do not exceed original video bitrate estimate (if known)
+    # We only have orig_total_kbps; ensure video_kbps < orig_total_kbps
+    if video_kbps >= orig_total_kbps:
+        video_kbps = max(32, int(orig_total_kbps * 0.9))
 
-    debug_lines.append(f"Choosing 2-pass mode: source_kbps={source_kbps}, multiplier={multiplier}, target_kbps={target_kbps}")
+    debug.append(f"Choosing two-pass mode: orig_total_kbps={orig_total_kbps}, target_total_kbps={target_total_kbps}, video_kbps={video_kbps}, audio_kbps={audio_kbps}")
 
+    # Build two-pass commands with passlog in tmp dir
     tmpdir = Path(tempfile.mkdtemp(prefix='vp9-pass-'))
     passlog_base = tmpdir / 'ffpass'
 
     vp9_common = [
         '-c:v', 'libvpx-vp9',
-        '-b:v', f'{target_kbps}k',
+        '-b:v', f'{video_kbps}k',
         '-tile-columns', '4',
         '-frame-parallel', '1',
         '-speed', '1',
@@ -233,7 +239,7 @@ def convert_one(input_path: Path, output_path: Path, crf: int, overwrite: bool, 
         '-pass', '1', '-an', '-f', 'null', null_dev
     ]
     pass2_cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', str(input_path)] + vp9_common + [
-        '-pass', '2', '-c:a', 'libopus', '-b:a', '64k', '-vf', 'scale=iw:ih', '-f', 'webm', str(output_path)
+        '-pass', '2', '-c:a', 'libopus', '-b:a', f'{audio_kbps}k', '-vf', 'scale=iw:ih', '-f', 'webm', str(output_path)
     ]
 
     if pretend:
@@ -241,7 +247,7 @@ def convert_one(input_path: Path, output_path: Path, crf: int, overwrite: bool, 
             shutil.rmtree(tmpdir)
         except Exception:
             pass
-        return input_path, True, 'pretend pass1: ' + ' '.join(pass1_cmd) + '\\npretend pass2: ' + ' '.join(pass2_cmd) + '\\n' + '\\n'.join(debug_lines)
+        return input_path, True, 'pretend pass1: ' + ' '.join(pass1_cmd) + '\npretend pass2: ' + ' '.join(pass2_cmd) + '\n' + '\n'.join(debug)
 
     try:
         subprocess.run(pass1_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -250,20 +256,20 @@ def convert_one(input_path: Path, output_path: Path, crf: int, overwrite: bool, 
             shutil.rmtree(tmpdir)
         except Exception:
             pass
-        return input_path, True, f'converted (two-pass {target_kbps}k) -> {output_path}\\n' + '\\n'.join(debug_lines)
+        return input_path, True, f'converted (two-pass video={video_kbps}k audio={audio_kbps}k) -> {output_path}\n' + '\n'.join(debug)
     except subprocess.CalledProcessError as e:
         err = e.stderr.decode(errors='ignore') if e.stderr else str(e)
         try:
             shutil.rmtree(tmpdir)
         except Exception:
             pass
-        return input_path, False, f'ffmpeg error: {err[:500]}\\n' + '\\n'.join(debug_lines)
+        return input_path, False, f'ffmpeg error: {err[:500]}\n' + '\n'.join(debug)
     except Exception as e:
         try:
             shutil.rmtree(tmpdir)
         except Exception:
             pass
-        return input_path, False, f'exception: {e}\\n' + '\\n'.join(debug_lines)
+        return input_path, False, f'exception: {e}\n' + '\n'.join(debug)
 
 
 def chunked(iterable: Iterable, size: int) -> Iterable[List]:
