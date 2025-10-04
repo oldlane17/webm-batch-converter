@@ -76,45 +76,41 @@ def make_output_path(input_path: Path, input_root: Path, output_root: Path) -> P
 def _get_source_stats(input_path: Path) -> tuple[int | None, float | None, int]:
     """
     Return (source_kbps, duration_seconds, filesize_bytes)
-    - source_kbps: average overall bitrate in kilobits-per-second (kb/s) if possible (video stream bit_rate or computed),
-      or None on error.
-    - duration_seconds: duration float or None.
-    - filesize_bytes: int
+    Converts duration to seconds correctly.
     """
     filesize = input_path.stat().st_size
     duration = None
     source_kbps = None
 
     try:
+        # Video stream info
         proc = subprocess.run(
             ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-             '-show_entries', 'stream=bit_rate,duration', '-of', 'default=noprint_wrappers=1:nokey=1',
-             str(input_path)],
+             '-show_entries', 'stream=bit_rate,duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', str(input_path)],
             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         lines = [l.strip() for l in proc.stdout.decode().splitlines() if l.strip() != '']
-        bit_rate = None
-        if len(lines) >= 1:
-            try:
-                br = float(lines[0])
-                if br > 0:
-                    bit_rate = int(br)
-            except Exception:
-                bit_rate = None
         if len(lines) >= 2:
             try:
-                d = float(lines[1])
-                if d > 0:
-                    duration = d
+                duration = float(lines[1])
+                # If duration > 3600s, maybe ffprobe returned milliseconds? Convert if necessary
+                if duration > 1000:  
+                    duration /= 1000.0
             except Exception:
                 duration = None
 
-        if bit_rate and bit_rate > 0:
-            source_kbps = int(round(bit_rate / 1000.0))
+        if len(lines) >= 1:
+            try:
+                bit_rate = float(lines[0])
+                if bit_rate > 0:
+                    source_kbps = int(round(bit_rate / 1000.0))
+            except Exception:
+                source_kbps = None
     except Exception:
         pass
 
-    # fallback: try format duration
+    # fallback: format-level duration
     if duration is None:
         try:
             proc2 = subprocess.run(
@@ -128,11 +124,10 @@ def _get_source_stats(input_path: Path) -> tuple[int | None, float | None, int]:
         except Exception:
             duration = None
 
-    # compute from filesize/duration if needed (container avg bitrate)
+    # compute average kbps if needed
     if (source_kbps is None or source_kbps == 0) and duration and duration > 0:
         try:
-            kbps = int(round((filesize * 8) / 1000.0 / duration))
-            source_kbps = kbps
+            source_kbps = int(round((filesize * 8) / 1000.0 / duration))
         except Exception:
             source_kbps = None
 
